@@ -14,7 +14,7 @@ to solve *regression* and *probabilistic classification* problems.
 The advantages of Gaussian processes are:
 
     - The prediction interpolates the observations (at least for regular
-      kernels).
+      kernels) in the noise-free case (no target noise is assumed).
 
     - The prediction is probabilistic (Gaussian) so that one can compute
       empirical confidence intervals and decide based on those if one should
@@ -43,30 +43,15 @@ Gaussian Process Regression (GPR)
 
 The :class:`GaussianProcessRegressor` implements Gaussian processes (GP) for
 regression purposes. For this, the prior of the GP needs to be specified. The
-prior mean is assumed to be constant and zero (for ``normalize_y=False``) or the
-training data's mean (for ``normalize_y=True``). The prior's
-covariance is specified by passing a :ref:`kernel <gp_kernels>` object. The
-hyperparameters of the kernel are optimized during fitting of
-GaussianProcessRegressor by maximizing the log-marginal-likelihood (LML) based
-on the passed ``optimizer``. As the LML may have multiple local optima, the
-optimizer can be started repeatedly by specifying ``n_restarts_optimizer``. The
-first run is always conducted starting from the initial hyperparameter values
-of the kernel; subsequent runs are conducted from hyperparameter values
-that have been chosen randomly from the range of allowed values.
-If the initial hyperparameters should be kept fixed, `None` can be passed as
-optimizer.
+prior mean is assumed to be constant and zero (for ``normalize_y=False``) or
+the training data's mean (for ``normalize_y=True``). The prior's covariance is
+specified by passing a :ref:`kernel <gp_kernels>` object. The
+:meth:`~GaussianProcessRegressor.fit` method will calculate the GP posterior
+given training data, based on Algorithm 2.1 of [RW2006]_. It will also
+automatically optimize kernel hyperparameters by default.
 
-The noise level in the targets can be specified by passing it via the
-parameter ``alpha``, either globally as a scalar or per datapoint.
-Note that a moderate noise level can also be helpful for dealing with numeric
-issues during fitting as it is effectively implemented as Tikhonov
-regularization, i.e., by adding it to the diagonal of the kernel matrix. An
-alternative to specifying the noise level explicitly is to include a
-WhiteKernel component into the kernel, which can estimate the global noise
-level from the data (see example below).
-
-The implementation is based on Algorithm 2.1 of [RW2006]_. In addition to
-the API of standard scikit-learn estimators, GaussianProcessRegressor:
+In addition to the API of standard ``scikit-learn``
+estimators, :class:`GaussianProcessRegressor`:
 
 * allows prediction without prior fitting (based on the GP prior)
 
@@ -75,15 +60,123 @@ the API of standard scikit-learn estimators, GaussianProcessRegressor:
 
 * exposes a method ``log_marginal_likelihood(theta)``, which can be used
   externally for other ways of selecting hyperparameters, e.g., via
-  Markov chain Monte Carlo.
+  Markov chain Monte Carlo or your favorite optimizer.
 
+
+Kernel hyperparameter optimization
+----------------------------------
+
+The hyperparameters of the kernel are optimized automatically when calling
+:meth:`~GaussianProcessRegressor.fit` by maximizing the log-marginal-likelihood
+(LML) based on the passed ``optimizer``. In each optimizer step a linear system
+:math:`(k(X,X) + \alpha\,I)\,w = y` is solved for the fit weights :math:`w` by
+following Alg. 2.1 from [RW2006]_, with :math:`k(X,X)` the
+kernel matrix built with all training points and :math:`y` the training
+targets. :math:`\alpha` is a regularization parameter (default is
+``alpha=1e-10``) to improve the linear system's numerical stability. As the LML
+may have multiple local optima, the optimizer can be started repeatedly by
+specifying ``n_restarts_optimizer``. The first run starts from the initial
+guess of each kernel hyperparameter such as ``RBF(length_scale=1.0)`` in case
+of the Radial Basis Function kernel. Subsequent runs use random hyperparameter
+start values sampled from a range of allowed values such as the default setting
+in ``RBF(length_scale_bounds=(1e-5, 1e5))``.
+
+If the initial hyperparameter values should be kept by disabling their
+optimization, then `None` can be passed as optimizer. In this case
+:meth:`~GaussianProcessRegressor.fit` will solve the linear system once using
+the provided initial hyperparameter values.
+
+The final fit weights :math:`w` obtained with optimized hyperparameters can be
+accessed by :attr:`GaussianProcessRegressor.alpha_`.
+
+Estimating or fixing target noise
+---------------------------------
+
+One can add a :class:`~sklearn.gaussian_process.kernels.WhiteKernel` component
+to the kernel, e.g. by using a sum kernel such as ``RBF() + WhiteKernel()``
+(more on kernels in `this section <gp_kernels_>`_). In this case the
+:class:`WhiteKernel`'s parameter `noise_level` (:math:`\sigma_n^2` in
+[RW2006]_) is treated as an additional kernel hyperparameter, which is
+optimized along with others such as :class:`RBF`'s `length_scale` parameter.
+This can be used to estimate a global scalar noise level from the data (see
+`this example <gpr_noise_est_>`_). During hyperparameter optimization, we now
+solve :math:`(k(X,X) + (\alpha+\sigma_n^2)\,I)\,w = y` in each iteration.
+
+If known, a fixed scalar noise level can be specified by
+``WhiteKernel(noise_level=noise_level, noise_level_bounds="fixed")``. With
+this, ``noise_level`` (:math:`\sigma_n^2`) will be held constant during
+hyperparameter optimization.
+
+Without :class:`WhiteKernel`, which implies :math:`\sigma_n^2=0` (and when
+:math:`\alpha=0`, see `this section for details <gp-alpha-role_>`_) we perform
+an interpolation of the training data since we assume the targets :math:`y` to
+be noise free. In this case :meth:`~GaussianProcessRegressor.predict` is
+equivalent to the `GPy <https://gpy.readthedocs.io>`_ library's
+`predict_noiseless()` method, where in particular the posterior covariance
+matrix ``y_cov`` returned by :meth:`~GaussianProcessRegressor.predict` is given
+by :math:`\text{cov}(\mathbf f_*)` in eq. 2.24 of [RW2006]_ ("noiseless
+predictions").
+
+If a non-zero noise via :class:`WhiteKernel` is present, then ``y_cov`` is
+given by :math:`\text{cov}(\mathbf f_*) + \sigma_n^2\,I`, which is equivalent
+to GPy's `predict()` method. We refer you to `this comparison of sklearn's
+implementation to other GP libraries
+<https://github.com/elcorto/gp_playground>`_ and `this discussion
+<https://github.com/scikit-learn/scikit-learn/issues/22945>`_ for more details.
+
+.. _gp-alpha-role:
+
+Special role of the regularization parameter ``alpha``
+------------------------------------------------------
+
+If :math:`\sigma_n^2=0`  (no :class:`WhiteKernel`) and :math:`\alpha>0` but
+very small such as ``1e-10`` and viewed as regularization parameter (the
+default in ``GaussianProcessRegressor``), we in fact assume that level of very
+small noise but often still call it interpolation, even though it is
+technically a regression with near zero assumed noise.
+
+Fixed noise in the targets *may* therefore also be specified by passing it as
+regularization parameter :math:`\alpha` in
+``GaussianProcessRegressor(alpha=...)`` instead of via :class:`WhiteKernel`,
+either globally (scalar) or per data point (1d array). However note that in
+contrast to specifying noise via :class:`WhiteKernel`, setting
+``alpha=noise_level`` will only affect ``y_mean`` returned by
+:meth:`~GaussianProcessRegressor.predict` and not ``y_std`` and ``y_cov``.
+
+:class:`GaussianProcessRegressor` does solve the same equation for the fit
+weights :math:`w` as :class:`~sklearn.kernel_ridge.KernelRidge` (see
+:attr:`KernelRidge.dual_coeff_`) when used with
+the same kernel. Therefore
+
+.. code-block:: python
+
+    KernelRidge(kernel=RBF(), alpha=noise_level).fit(X,y).predict(X)
+
+will lead to the same predictions as GPR with :math:`\sigma_n^2=0,
+\alpha>0`
+
+.. code-block:: python
+
+    GaussianProcessRegressor(kernel=RBF(),
+                             alpha=noise_level,
+                             optimizer=None).fit(X,y).predict(X)
+
+or :math:`\sigma_n^2>0, \alpha=0`
+
+.. code-block:: python
+
+    GaussianProcessRegressor(kernel=RBF()+WhiteKernel(noise_level=noise_level),
+                             alpha=0,
+                             optimizer=None).fit(X,y).predict(X)
 
 GPR examples
 ============
 
+.. _gpr_noise_est:
+
 GPR with noise-level estimation
 -------------------------------
-This example illustrates that GPR with a sum-kernel including a WhiteKernel can
+This example illustrates that GPR with a sum-kernel including a :class:`WhiteKernel` can
 estimate the noise level of data. An illustration of the
 log-marginal-likelihood (LML) landscape shows that there exist two local
 maxima of LML.
@@ -139,7 +232,7 @@ the learned model of KRR and GPR based on a ExpSineSquared kernel, which is
 suited for learning periodic functions. The kernel's hyperparameters control
 the smoothness (length_scale) and periodicity of the kernel (periodicity).
 Moreover, the noise level
-of the data is learned explicitly by GPR by an additional WhiteKernel component
+of the data is learned explicitly by GPR by an additional :class:`WhiteKernel` component
 in the kernel and by the regularization parameter alpha of KRR.
 
 .. figure:: ../auto_examples/gaussian_process/images/sphx_glr_plot_compare_gpr_krr_005.png
@@ -193,7 +286,7 @@ different properties of the signal:
 
 - a "noise" term, consisting of an RBF kernel contribution, which shall
   explain the correlated noise components such as local weather phenomena,
-  and a WhiteKernel contribution for the white noise. The relative amplitudes
+  and a :class:`WhiteKernel` contribution for the white noise. The relative amplitudes
   and the RBF's length scale are further free parameters.
 
 Maximizing the log-marginal-likelihood after subtracting the target's mean
@@ -251,7 +344,7 @@ Chapter 3 of [RW2006]_.
 The GP prior mean is assumed to be zero. The prior's
 covariance is specified by passing a :ref:`kernel <gp_kernels>` object. The
 hyperparameters of the kernel are optimized during fitting of
-GaussianProcessRegressor by maximizing the log-marginal-likelihood (LML) based
+:class:`GaussianProcessRegressor` by maximizing the log-marginal-likelihood (LML) based
 on the passed ``optimizer``. As the LML may have multiple local optima, the
 optimizer can be started repeatedly by specifying ``n_restarts_optimizer``. The
 first run is always conducted starting from the initial hyperparameter values
